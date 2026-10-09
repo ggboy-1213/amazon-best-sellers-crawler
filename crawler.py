@@ -31,6 +31,7 @@ import random
 import re
 import sys
 import time
+from urllib.parse import urlparse
 
 import requests
 
@@ -77,6 +78,23 @@ MAX_RETRY = config.get_int("MAX_RETRY", 4)
 BSR_DELAY = config.get_delay_range("BSR_DELAY_MIN", "BSR_DELAY_MAX", (0.9, 1.7))
 SEARCH_DELAY = config.get_delay_range("SEARCH_DELAY_MIN", "SEARCH_DELAY_MAX", (1.5, 3.0))
 
+# 代理: 浏览器(搜索页)始终走代理; BSR(requests)默认直连, 设 BSR_PROXY=1 才走代理
+PROXY_URL = config.get("PROXY_URL", "").strip()
+BSR_USE_PROXY = config.get("BSR_PROXY", "0").strip().lower() in ("1", "true", "yes", "y")
+SEARCH_FAIL_BREAKER = config.get_int("SEARCH_FAIL_BREAKER", 5)  # 连续失败N个类目则中止SEARCH阶段
+
+
+def proxy_for_playwright():
+    if not PROXY_URL:
+        return None
+    u = urlparse(PROXY_URL)
+    conf = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        conf["username"] = u.username
+    if u.password:
+        conf["password"] = u.password
+    return conf
+
 
 def node_url(node_id: str, pg: int) -> str:
     return f"{BASE}/Best-Sellers/zgbs/{DEPT}/{node_id}/ref=zg_bs_pg_{pg}_{DEPT}?_encoding=UTF8&pg={pg}"
@@ -93,15 +111,22 @@ class Browser:
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
         os.makedirs(CHROME_PROFILE, exist_ok=True)
-        self.ctx = self._pw.chromium.launch_persistent_context(
+        # CHROME_CHANNEL: chrome=系统版Chrome(Windows本地); 留空=Playwright自带Chromium(Linux服务器)
+        channel = config.get("CHROME_CHANNEL", "").strip() or None
+        launch_kwargs = dict(
             user_data_dir=os.path.abspath(CHROME_PROFILE),
-            channel="chrome",
+            channel=channel,
             headless=False,
             locale="en-US",
             timezone_id="America/New_York",
             viewport={"width": 1366, "height": 900},
             args=["--disable-blink-features=AutomationControlled", "--window-position=320,180"],
         )
+        pw_proxy = proxy_for_playwright()
+        if pw_proxy:
+            launch_kwargs["proxy"] = pw_proxy
+            print(f"[browser] 搜索页走代理: {pw_proxy['server']}, 出口地区见 .env 用户名 region- 参数")
+        self.ctx = self._pw.chromium.launch_persistent_context(**launch_kwargs)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         self._warmed = False
 
@@ -117,9 +142,16 @@ class Browser:
             self._warmed = True
             return
         print("    [browser] 预热: 打开首页建立会话...")
-        self.page.goto(BASE + "/", timeout=60000, wait_until="domcontentloaded")
-        self.page.wait_for_timeout(5000 + random.randint(0, 3000))
-        self._warmed = True
+        for i in range(1, 4):
+            try:
+                self.page.goto(BASE + "/", timeout=60000, wait_until="domcontentloaded")
+                self.page.wait_for_timeout(5000 + random.randint(0, 3000))
+                self._warmed = True
+                return
+            except Exception as e:
+                print(f"    [browser] 预热第{i}次失败: {str(e).splitlines()[0][:70]}")
+                time.sleep(4 * i)
+        raise RuntimeError("homepage warmup failed after 3 retries")
 
     def fetch_search(self, url: str, want_tiles=True) -> list:
         """打开搜索页, 返回按 DOM 顺序排列的 ASIN 列表; 被拦截时自动重试/再预热"""
@@ -127,6 +159,13 @@ class Browser:
             self.warm_up(force=(attempt > 1))
             try:
                 self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                self.page.wait_for_timeout(1500 + random.randint(0, 800))
+                # 快速预检: 已知拦截页直接判失败, 不等选择器超时
+                early = self.page.content()
+                if "unauthorized AI agent" in early:
+                    raise RuntimeError("AI-AGENT-BLOCK")
+                if "Sorry! Something went wrong" in self.page.title():
+                    raise RuntimeError("503-BLOCK")
                 if want_tiles:
                     self.page.wait_for_selector(
                         "div[data-component-type=s-search-result]", timeout=25000)
@@ -141,8 +180,21 @@ class Browser:
                            document.querySelectorAll('div[data-component-type="s-search-result"]'))
                            .map(d => d.getAttribute('data-asin')).filter(Boolean)""")
             except Exception as e:
-                msg = str(e).split("\n")[0][:80]
-                print(f"    [browser] 第{attempt}次失败: {msg}")
+                # 诊断页面类型: ai-agent拦截页 / bm-verify质询页 / 503页, 便于判断封锁原因
+                try:
+                    t = self.page.title()
+                    h = self.page.content()
+                    if "unauthorized AI agent" in h:
+                        kind = "AI-AGENT-BLOCK"
+                    elif "bm-verify" in h:
+                        kind = "JS-CHALLENGE"
+                    elif "Sorry! Something went wrong" in t:
+                        kind = "503-BLOCK"
+                    else:
+                        kind = "unknown"
+                    print(f"    [browser] 第{attempt}次失败: {kind} title={t[:35]!r}")
+                except Exception:
+                    print(f"    [browser] 第{attempt}次失败: {str(e).splitlines()[0][:70]}")
                 time.sleep(5 * attempt + random.uniform(0, 3))
         raise RuntimeError(f"browser fetch failed after 3 attempts: {url[:80]}")
 
@@ -157,6 +209,9 @@ class Crawler:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        if BSR_USE_PROXY and PROXY_URL:
+            self.session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+            print(f"[bsr] requests 走代理: {urlparse(PROXY_URL).hostname}")
         self.nodes = {}          # node_id -> BSR 记录 (含 children/name/parent)
         self.search_done = set()  # 已完成搜索页抓取的 node_id
         self.pending = []        # BFS 队列 [node_id, name, parent, depth]
@@ -300,6 +355,7 @@ class Crawler:
                                    self.nodes[nid]["depth"], nid))
         print(f"SEARCH 阶段: 待抓 {len(todo)} 个类目 (共 {len(self.nodes)})")
         done = 0
+        consecutive_fail = 0
         for idx, node_id in enumerate(todo, 1):
             rec = self.nodes[node_id]
             leaf = 0 if rec["children"] else 1
@@ -311,7 +367,14 @@ class Crawler:
                 print(f"    ✗ 失败: {e}")
                 self.failed_search.append(node_id)
                 self.save_state()
+                consecutive_fail += 1
+                if consecutive_fail >= SEARCH_FAIL_BREAKER:
+                    print(f"!! 连续 {consecutive_fail} 个类目失败, 疑似代理/IP 被封, "
+                          f"中止 SEARCH 阶段 (已完成的 {len(self.search_done)} 个不受影响, "
+                          f"重跑可续)")
+                    break
                 continue
+            consecutive_fail = 0
             db.save_products(self.db, node_id, "SEARCH",
                              [(r, a, rec.get("name") or node_id, self.path_of(node_id), leaf)
                               for r, a in rows])
