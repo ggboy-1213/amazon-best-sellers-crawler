@@ -85,6 +85,11 @@ BSR_USE_PROXY = config.get("BSR_PROXY", "0").strip().lower() in ("1", "true", "y
 SEARCH_FAIL_BREAKER = config.get_int("SEARCH_FAIL_BREAKER", 5)  # 连续失败N个类目则中止SEARCH阶段
 # 本机是否跑搜索页阶段 (服务器上设 0, 搜索页由有干净 IP 的机器负责)
 SEARCH_ENABLED = config.get("ENABLE_SEARCH", "1").strip().lower() in ("1", "true", "yes", "y")
+# 搜索页遇到 "No results" 软限流时的冷却等待 (秒), 之后清 cookie 重试
+THROTTLE_COOLDOWN = config.get_int("THROTTLE_COOLDOWN", 120)
+# 每爬 N 个搜索页插入一次长休息, 避免触发速率限制 (0=关闭)
+LONG_PAUSE_EVERY_PAGES = config.get_int("LONG_PAUSE_EVERY_PAGES", 40)
+LONG_PAUSE_SECS = config.get_int("LONG_PAUSE_SECS", 75)
 
 
 def proxy_for_playwright():
@@ -158,15 +163,18 @@ class Browser:
 
     def fetch_search(self, url: str, want_tiles=True) -> list:
         """打开搜索页, 返回按 DOM 顺序排列的 ASIN 列表; 被拦截时自动重试/再预热"""
+        last_kind = "?"
         for attempt in range(1, 4):
             self.warm_up(force=(attempt > 1))
             try:
                 self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 self.page.wait_for_timeout(1500 + random.randint(0, 800))
-                # 快速预检: 已知拦截页直接判失败, 不等选择器超时
+                # 快速预检: 已知拦截/限流页直接判失败, 不等选择器超时
                 early = self.page.content()
                 if "unauthorized AI agent" in early:
                     raise RuntimeError("AI-AGENT-BLOCK")
+                if "No results for your search" in early:
+                    raise RuntimeError("NO-RESULTS-THROTTLED")  # 高频搜索触发的软限流
                 if "Sorry! Something went wrong" in self.page.title():
                     raise RuntimeError("503-BLOCK")
                 if want_tiles:
@@ -183,11 +191,13 @@ class Browser:
                            document.querySelectorAll('div[data-component-type="s-search-result"]'))
                            .map(d => d.getAttribute('data-asin')).filter(Boolean)""")
             except Exception as e:
-                # 诊断页面类型: ai-agent拦截页 / bm-verify质询页 / 503页, 便于判断封锁原因
+                # 诊断页面类型: 限流页 / AI拦截页 / 质询页 / 503页
                 try:
                     t = self.page.title()
                     h = self.page.content()
-                    if "unauthorized AI agent" in h:
+                    if "No results for your search" in h:
+                        kind = "NO-RESULTS-THROTTLED"
+                    elif "unauthorized AI agent" in h:
                         kind = "AI-AGENT-BLOCK"
                     elif "bm-verify" in h:
                         kind = "JS-CHALLENGE"
@@ -195,11 +205,20 @@ class Browser:
                         kind = "503-BLOCK"
                     else:
                         kind = "unknown"
-                    print(f"    [browser] 第{attempt}次失败: {kind} title={t[:35]!r}")
+                    last_kind = kind
+                    print(f"    [browser] 第{attempt}次失败: {kind} title={t[:35]!r}", flush=True)
                 except Exception:
-                    print(f"    [browser] 第{attempt}次失败: {str(e).splitlines()[0][:70]}")
-                time.sleep(5 * attempt + random.uniform(0, 3))
-        raise RuntimeError(f"browser fetch failed after 3 attempts: {url[:80]}")
+                    last_kind = str(e)
+                    print(f"    [browser] 第{attempt}次失败: {str(e).splitlines()[0][:70]}", flush=True)
+                if last_kind == "NO-RESULTS-THROTTLED":
+                    # 限流: 冷却等待 + 清会话, 而不是快速重试火上浇油
+                    print(f"    [browser] 触发限流, 冷却 {THROTTLE_COOLDOWN}s 后清 cookie 重试...", flush=True)
+                    time.sleep(THROTTLE_COOLDOWN)
+                    self.ctx.clear_cookies()
+                    self._warmed = False
+                else:
+                    time.sleep(5 * attempt + random.uniform(0, 3))
+        raise RuntimeError(f"browser fetch failed after 3 attempts ({last_kind}): {url[:80]}")
 
     def close(self):
         try:
@@ -419,6 +438,11 @@ class Crawler:
             if len(rows) >= MAX_SEARCH_ITEMS or len(asins) < 10:
                 break
             time.sleep(random.uniform(*SEARCH_DELAY))
+            # 定期长休息, 降低触发限流的概率
+            if LONG_PAUSE_EVERY_PAGES and pg % LONG_PAUSE_EVERY_PAGES == 0:
+                pause = LONG_PAUSE_SECS + random.uniform(0, 30)
+                print(f"    [pace] 已连爬 {pg} 页, 休息 {pause:.0f}s", flush=True)
+                time.sleep(pause)
         return rows, pages_used
 
     # ---------- 工具 ----------
