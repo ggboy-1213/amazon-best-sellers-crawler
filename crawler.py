@@ -55,6 +55,7 @@ MAX_SEARCH_PAGES = config.get_int("MAX_SEARCH_PAGES", 12)  # 搜索页单页 ~48
 
 OUT_DIR = config.get("OUT_DIR", "output")
 STATE_FILE = os.path.join(OUT_DIR, "state.json")
+SEARCH_DONE_FILE = os.path.join(OUT_DIR, "search_done.json")  # 独立文件: BSR 和 SEARCH 可在不同机器跑
 PAGES_FILE = os.path.join(OUT_DIR, "pages.jsonl")
 CHROME_PROFILE = os.path.join(OUT_DIR, "chrome_profile")
 
@@ -82,6 +83,8 @@ SEARCH_DELAY = config.get_delay_range("SEARCH_DELAY_MIN", "SEARCH_DELAY_MAX", (1
 PROXY_URL = config.get("PROXY_URL", "").strip()
 BSR_USE_PROXY = config.get("BSR_PROXY", "0").strip().lower() in ("1", "true", "yes", "y")
 SEARCH_FAIL_BREAKER = config.get_int("SEARCH_FAIL_BREAKER", 5)  # 连续失败N个类目则中止SEARCH阶段
+# 本机是否跑搜索页阶段 (服务器上设 0, 搜索页由有干净 IP 的机器负责)
+SEARCH_ENABLED = config.get("ENABLE_SEARCH", "1").strip().lower() in ("1", "true", "yes", "y")
 
 
 def proxy_for_playwright():
@@ -221,23 +224,34 @@ class Crawler:
 
     # ---------- 状态 ----------
     def load_state(self):
-        if not os.path.exists(STATE_FILE):
-            return
-        with open(STATE_FILE, encoding="utf-8") as f:
-            state = json.load(f)
-        for line in state.get("done", []):
-            rec = json.loads(line)
-            self.nodes[rec["node_id"]] = rec
-        self.search_done = set(state.get("search_done", []))
-        self.pending = state.get("pending", [])
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, encoding="utf-8") as f:
+                state = json.load(f)
+            for line in state.get("done", []):
+                rec = json.loads(line)
+                self.nodes[rec["node_id"]] = rec
+            self.pending = state.get("pending", [])
+            # 兼容旧格式: state.json 里内嵌的 search_done 迁移到独立文件
+            legacy = set(state.get("search_done", []))
+            if legacy:
+                self.search_done |= legacy
+                self._save_search_done()
+        if os.path.exists(SEARCH_DONE_FILE):
+            with open(SEARCH_DONE_FILE, encoding="utf-8") as f:
+                self.search_done |= set(json.load(f))
         print(f"[resume] BSR 已完成 {len(self.nodes)}, SEARCH 已完成 {len(self.search_done)}, "
               f"队列 {len(self.pending)}")
+
+    def _save_search_done(self):
+        tmp = SEARCH_DONE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(self.search_done), f)
+        os.replace(tmp, SEARCH_DONE_FILE)
 
     def save_state(self):
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"done": [json.dumps(r, ensure_ascii=False) for r in self.nodes.values()],
-                       "search_done": sorted(self.search_done),
                        "pending": self.pending}, f, ensure_ascii=False)
         os.replace(tmp, STATE_FILE)
 
@@ -379,6 +393,7 @@ class Crawler:
                              [(r, a, rec.get("name") or node_id, self.path_of(node_id), leaf)
                               for r, a in rows])
             self.search_done.add(node_id)
+            self._save_search_done()
             self.save_state()
             print(f"    ✓ {len(rows)} ASINs / {n_pages} 页")
             done += 1
@@ -449,12 +464,15 @@ def main():
         c.run_bsr(max_nodes=args.max_nodes)
 
     if not args.bsr_only:
-        browser = Browser()
-        try:
-            browser.warm_up()
-            c.run_search(browser, max_nodes=args.max_nodes)
-        finally:
-            browser.close()
+        if not SEARCH_ENABLED:
+            print("ENABLE_SEARCH=0, 跳过搜索页阶段 (本机只负责 BSR)")
+        else:
+            browser = Browser()
+            try:
+                browser.warm_up()
+                c.run_search(browser, max_nodes=args.max_nodes)
+            finally:
+                browser.close()
 
     st = db.stats(c.db)
     print(f"MySQL 统计: {st}")

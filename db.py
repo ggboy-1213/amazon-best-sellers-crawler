@@ -22,13 +22,26 @@ SITE = config.get("SITE", "US")
 
 
 def connect() -> pymysql.connections.Connection:
-    return pymysql.connect(**MYSQL_CONF, autocommit=False)
+    return pymysql.connect(**MYSQL_CONF, autocommit=False, read_timeout=60, write_timeout=60)
+
+
+def _ensure_alive(conn: pymysql.connections.Connection) -> pymysql.connections.Connection:
+    """隧道/长连接可能断开, 每次写库前 ping 一下, 断了自动重连"""
+    try:
+        conn.ping(reconnect=True)
+    except Exception:
+        conn.close()
+        new_conn = connect()
+        # 原地替换连接对象内容, 调用方持有引用不变
+        conn.__dict__.update(new_conn.__dict__)
+    return conn
 
 
 def save_products(conn, node_id: str, source: str, rows: list):
     """rows: [(rank, asin), ...] 按 rank 升序; 先删该类目该来源的旧行再插入"""
     if not rows:
         return
+    _ensure_alive(conn)
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM category_top_products WHERE site=%s AND node_id=%s AND source=%s",
@@ -44,6 +57,7 @@ def save_products(conn, node_id: str, source: str, rows: list):
 
 def update_category_meta(conn, node_id: str, category_name: str, category_path: str, is_leaf: int):
     """补齐/刷新某类目所有行的类目元信息 (名称/路径/是否叶子)"""
+    _ensure_alive(conn)
     with conn.cursor() as cur:
         cur.execute(
             """UPDATE category_top_products
@@ -54,6 +68,7 @@ def update_category_meta(conn, node_id: str, category_name: str, category_path: 
 
 
 def stats(conn) -> dict:
+    _ensure_alive(conn)
     with conn.cursor() as cur:
         cur.execute("""SELECT source, COUNT(*), COUNT(DISTINCT node_id)
                        FROM category_top_products GROUP BY source""")
@@ -65,6 +80,7 @@ def stats(conn) -> dict:
 
 def fetch_all(conn):
     """导出用: 全表按类目路径+来源+排名排序"""
+    _ensure_alive(conn)
     with conn.cursor() as cur:
         cur.execute("""SELECT node_id, category_name, category_path, is_leaf, source,
                               top_rank, asin, product_url, crawl_time
