@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-MySQL 存储层 (本地 MySQL 8.0, root/123456)
+MySQL 存储层 (连接配置见 .env 的 MYSQL_* 项)
 
 库: amazon_bestsellers   表: category_top_products (建表脚本见 schema.sql)
 写入策略: 按 (site, node_id, source) 先删后插, 事务保证幂等 —— 重复爬取不产生脏数据
 """
 import pymysql
 
+import config
+
 MYSQL_CONF = dict(
-    host="127.0.0.1",
-    user="root",
-    password="123456",
-    database="amazon_bestsellers",
-    charset="utf8mb4",
+    host=config.get("MYSQL_HOST", "127.0.0.1"),
+    port=config.get_int("MYSQL_PORT", 3306),
+    user=config.get("MYSQL_USER", "root"),
+    password=config.get("MYSQL_PASSWORD", ""),
+    database=config.get("MYSQL_DATABASE", "amazon_bestsellers"),
+    charset=config.get("MYSQL_CHARSET", "utf8mb4"),
 )
 
-SITE = "US"
+SITE = config.get("SITE", "US")
 
 
 def connect() -> pymysql.connections.Connection:

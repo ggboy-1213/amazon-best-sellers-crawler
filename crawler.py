@@ -14,6 +14,7 @@ Amazon Best Sellers (Women's Fashion) 子类目商品爬虫 v2
     Akamai 防护强, 必须真实浏览器 + 先访问首页预热建立会话。
 
 断点续爬: output/state.json 记录 BSR 完成节点 + SEARCH 完成节点, 重跑自动跳过。
+所有配置项 (站点/根类目/MySQL/限速等) 在 .env 文件中修改。
 
 用法:
   python crawler.py                 # 全流程 (BSR 续爬 -> SEARCH 续爬 -> 导出CSV)
@@ -33,6 +34,8 @@ import time
 
 import requests
 
+import config
+
 try:
     # Windows 下 Python 自带证书包可能缺根证书, 优先用系统证书库
     import truststore
@@ -42,21 +45,23 @@ except ImportError:
 
 import db
 
-BASE = "https://www.amazon.com"
-ROOT_NODE = "7147440011"
-ROOT_NAME = "Women's Fashion"
-DEPT = "fashion"
-MAX_SEARCH_ITEMS = 400
-MAX_SEARCH_PAGES = 12          # 搜索页单页 ~48 个, 400 个最多 9 页, 留余量
+BASE = config.get("AMAZON_BASE", "https://www.amazon.com")
+ROOT_NODE = config.get("ROOT_NODE", "7147440011")
+ROOT_NAME = config.get("ROOT_NAME", "Women's Fashion")
+DEPT = config.get("DEPT", "fashion")
+MAX_SEARCH_ITEMS = config.get_int("MAX_SEARCH_ITEMS", 400)
+MAX_SEARCH_PAGES = config.get_int("MAX_SEARCH_PAGES", 12)  # 搜索页单页 ~48 个, 留余量
 
-OUT_DIR = "output"
+OUT_DIR = config.get("OUT_DIR", "output")
 STATE_FILE = os.path.join(OUT_DIR, "state.json")
 PAGES_FILE = os.path.join(OUT_DIR, "pages.jsonl")
 CHROME_PROFILE = os.path.join(OUT_DIR, "chrome_profile")
 
 HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "User-Agent": config.get(
+        "USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
@@ -68,9 +73,9 @@ RECS_LIST_RE = re.compile(r'data-client-recs-list="([^"]+)"')
 CHALLENGE_HINTS = ("bm-verify", "api-services-support@amazon.com",
                    "To discuss automated access", "Enter the characters you see below")
 
-MAX_RETRY = 4
-BSR_DELAY = (0.9, 1.7)         # BSR requests 间隔
-SEARCH_DELAY = (1.5, 3.0)      # 浏览器搜索页间隔
+MAX_RETRY = config.get_int("MAX_RETRY", 4)
+BSR_DELAY = config.get_delay_range("BSR_DELAY_MIN", "BSR_DELAY_MAX", (0.9, 1.7))
+SEARCH_DELAY = config.get_delay_range("SEARCH_DELAY_MIN", "SEARCH_DELAY_MAX", (1.5, 3.0))
 
 
 def node_url(node_id: str, pg: int) -> str:
