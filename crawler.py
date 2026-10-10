@@ -83,8 +83,16 @@ SEARCH_DELAY = config.get_delay_range("SEARCH_DELAY_MIN", "SEARCH_DELAY_MAX", (1
 PROXY_URL = config.get("PROXY_URL", "").strip()
 BSR_USE_PROXY = config.get("BSR_PROXY", "0").strip().lower() in ("1", "true", "yes", "y")
 SEARCH_FAIL_BREAKER = config.get_int("SEARCH_FAIL_BREAKER", 5)  # 连续失败N个类目则中止SEARCH阶段
-# 本机是否跑搜索页阶段 (服务器上设 0, 搜索页由有干净 IP 的机器负责)
-SEARCH_ENABLED = config.get("ENABLE_SEARCH", "1").strip().lower() in ("1", "true", "yes", "y")
+# 抓取模式: all=BSR+搜索页都爬 / bsr=只爬BSR / search=只爬搜索页
+CRAWL_MODE = config.get("CRAWL_MODE", "").strip().lower()
+if CRAWL_MODE not in ("all", "bsr", "search"):
+    # 兼容旧配置: ENABLE_SEARCH=0 等价于 bsr 模式
+    if config.get("ENABLE_SEARCH", "1").strip().lower() in ("0", "false", "no"):
+        CRAWL_MODE = "bsr"
+    else:
+        CRAWL_MODE = "all"
+RUN_BSR = CRAWL_MODE in ("all", "bsr")
+RUN_SEARCH = CRAWL_MODE in ("all", "search")
 # 搜索页遇到 "No results" 软限流时的冷却等待 (秒), 之后清 cookie 重试
 THROTTLE_COOLDOWN = config.get_int("THROTTLE_COOLDOWN", 120)
 # 连续 N 个类目都因限流失败后, 类目之间强制长冷却 (秒)
@@ -508,18 +516,21 @@ def main():
         c.pending = [list(t) for t in queue]
         print(f"[recrawl] 强制重爬 {len(queue)} 个类目")
 
+    print(f"[mode] CRAWL_MODE={CRAWL_MODE} (BSR: {'开' if RUN_BSR else '关'}, "
+          f"搜索页: {'开' if RUN_SEARCH else '关'})")
+
     # 断点恢复时把已有的 BSR 记录同步进 MySQL (幂等)
-    if not args.search_only and c.nodes:
+    if RUN_BSR and not args.search_only and c.nodes:
         print(f"同步 {len(c.nodes)} 条已有 BSR 记录到 MySQL...")
         for rec in c.nodes.values():
             c._save_bsr_to_db(rec)
 
-    if not args.search_only:
+    if RUN_BSR and not args.search_only:
         c.run_bsr(max_nodes=args.max_nodes)
 
     if not args.bsr_only:
-        if not SEARCH_ENABLED:
-            print("ENABLE_SEARCH=0, 跳过搜索页阶段 (本机只负责 BSR)")
+        if not RUN_SEARCH:
+            print("CRAWL_MODE 不含 search, 跳过搜索页阶段")
         else:
             browser = Browser()
             try:
