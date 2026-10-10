@@ -87,6 +87,9 @@ SEARCH_FAIL_BREAKER = config.get_int("SEARCH_FAIL_BREAKER", 5)  # 连续失败N�
 SEARCH_ENABLED = config.get("ENABLE_SEARCH", "1").strip().lower() in ("1", "true", "yes", "y")
 # 搜索页遇到 "No results" 软限流时的冷却等待 (秒), 之后清 cookie 重试
 THROTTLE_COOLDOWN = config.get_int("THROTTLE_COOLDOWN", 120)
+# 连续 N 个类目都因限流失败后, 类目之间强制长冷却 (秒)
+THROTTLE_NODE_COOLDOWN = config.get_int("THROTTLE_NODE_COOLDOWN", 900)
+THROTTLE_NODE_STREAK = config.get_int("THROTTLE_NODE_STREAK", 2)
 # 每爬 N 个搜索页插入一次长休息, 避免触发速率限制 (0=关闭)
 LONG_PAUSE_EVERY_PAGES = config.get_int("LONG_PAUSE_EVERY_PAGES", 40)
 LONG_PAUSE_SECS = config.get_int("LONG_PAUSE_SECS", 75)
@@ -389,25 +392,34 @@ class Crawler:
         print(f"SEARCH 阶段: 待抓 {len(todo)} 个类目 (共 {len(self.nodes)})")
         done = 0
         consecutive_fail = 0
+        throttle_streak = 0
         for idx, node_id in enumerate(todo, 1):
             rec = self.nodes[node_id]
             leaf = 0 if rec["children"] else 1
             print(f"[SEARCH {idx}/{len(todo)}] node={node_id} {rec.get('name')!r} "
-                  f"({'leaf' if leaf else 'branch'})")
+                  f"({'leaf' if leaf else 'branch'})", flush=True)
             try:
                 rows, n_pages = self.crawl_search_node(browser, node_id, rec)
             except RuntimeError as e:
-                print(f"    ✗ 失败: {e}")
+                print(f"    ✗ 失败: {e}", flush=True)
                 self.failed_search.append(node_id)
                 self.save_state()
                 consecutive_fail += 1
+                if "NO-RESULTS-THROTTLED" in str(e):
+                    throttle_streak += 1
+                    if throttle_streak >= THROTTLE_NODE_STREAK:
+                        wait = THROTTLE_NODE_COOLDOWN + random.uniform(0, 120)
+                        print(f"!! 连续 {throttle_streak} 个类目限流, 本机 IP 进入较深的限流窗口, "
+                              f"休息 {wait:.0f}s 后再继续...", flush=True)
+                        time.sleep(wait)
+                        throttle_streak = 0
                 if consecutive_fail >= SEARCH_FAIL_BREAKER:
-                    print(f"!! 连续 {consecutive_fail} 个类目失败, 疑似代理/IP 被封, "
-                          f"中止 SEARCH 阶段 (已完成的 {len(self.search_done)} 个不受影响, "
-                          f"重跑可续)")
+                    print(f"!! 连续 {consecutive_fail} 个类目失败, 中止 SEARCH 阶段 "
+                          f"(已完成的 {len(self.search_done)} 个不受影响, 重跑可续)", flush=True)
                     break
                 continue
             consecutive_fail = 0
+            throttle_streak = 0
             db.save_products(self.db, node_id, "SEARCH",
                              [(r, a, rec.get("name") or node_id, self.path_of(node_id), leaf)
                               for r, a in rows])
