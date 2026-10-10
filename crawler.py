@@ -314,9 +314,16 @@ class Crawler:
         return items, children
 
     def crawl_bsr_node(self, node_id: str):
-        html = self.fetch_bsr(node_url(node_id, 1))
-        time.sleep(random.uniform(*BSR_DELAY))
-        items1, children = self.parse_bsr(html)
+        # 第1页偶尔会拿到被精简的空页面(无 recs-list), 重试几次再定论
+        html, items1, children = "", [], {}
+        for try_i in range(1, 4):
+            html = self.fetch_bsr(node_url(node_id, 1))
+            time.sleep(random.uniform(*BSR_DELAY))
+            items1, children = self.parse_bsr(html)
+            if items1 or try_i == 3:
+                break
+            print(f"    ! 第1页无商品数据(第{try_i}次), 15s 后重试", flush=True)
+            time.sleep(15)
         items2 = []
         if items1:
             html2 = self.fetch_bsr(node_url(node_id, 2))
@@ -483,10 +490,23 @@ def main():
     ap.add_argument("--search-only", action="store_true", help="只跑搜索页 Top400 阶段")
     ap.add_argument("--max-nodes", type=int, default=None, help="限制本次处理的类目数量")
     ap.add_argument("--no-export", action="store_true", help="结束时不导出 CSV")
+    ap.add_argument("--recrawl", default=None, help="强制重爬指定类目 (逗号分隔 node_id)")
     args = ap.parse_args()
 
     c = Crawler()
     c.load_state()
+
+    if args.recrawl:
+        nids = [n.strip() for n in args.recrawl.split(",") if n.strip()]
+        queue = []
+        for nid in nids:
+            rec = c.nodes.pop(nid, None)
+            if rec:
+                queue.append((nid, rec.get("name") or nid, rec.get("parent", ""), rec["depth"]))
+            else:
+                queue.append((nid, nid, "", 1))
+        c.pending = [list(t) for t in queue]
+        print(f"[recrawl] 强制重爬 {len(queue)} 个类目")
 
     # 断点恢复时把已有的 BSR 记录同步进 MySQL (幂等)
     if not args.search_only and c.nodes:
