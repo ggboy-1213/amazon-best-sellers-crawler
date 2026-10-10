@@ -172,12 +172,15 @@ class Browser:
             try:
                 self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 self.page.wait_for_timeout(1500 + random.randint(0, 800))
-                # 快速预检: 已知拦截/限流页直接判失败, 不等选择器超时
+                # 快速预检: 已知拦截页直接判失败, 不等选择器超时
                 early = self.page.content()
                 if "unauthorized AI agent" in early:
                     raise RuntimeError("AI-AGENT-BLOCK")
                 if "No results for your search" in early:
-                    raise RuntimeError("NO-RESULTS-THROTTLED")  # 高频搜索触发的软限流
+                    # 翻页超出结果总数 (如 "385-351 of 351 results") —— 到末页了, 不是错误
+                    # 返回空列表, crawl_search_node 会正常收尾该类目
+                    print("    [browser] 已到结果末页 (No results 页), 该类目抓取完成", flush=True)
+                    return []
                 if "Sorry! Something went wrong" in self.page.title():
                     raise RuntimeError("503-BLOCK")
                 if want_tiles:
@@ -194,13 +197,15 @@ class Browser:
                            document.querySelectorAll('div[data-component-type="s-search-result"]'))
                            .map(d => d.getAttribute('data-asin')).filter(Boolean)""")
             except Exception as e:
-                # 诊断页面类型: 限流页 / AI拦截页 / 质询页 / 503页
+                # 诊断页面类型: AI拦截页 / 质询页 / 503页
                 try:
                     t = self.page.title()
                     h = self.page.content()
                     if "No results for your search" in h:
-                        kind = "NO-RESULTS-THROTTLED"
-                    elif "unauthorized AI agent" in h:
+                        # 选择器阶段才出现的末页(竞态), 同样按正常结束处理
+                        print("    [browser] 已到结果末页, 该类目抓取完成", flush=True)
+                        return []
+                    if "unauthorized AI agent" in h:
                         kind = "AI-AGENT-BLOCK"
                     elif "bm-verify" in h:
                         kind = "JS-CHALLENGE"
@@ -213,14 +218,7 @@ class Browser:
                 except Exception:
                     last_kind = str(e)
                     print(f"    [browser] 第{attempt}次失败: {str(e).splitlines()[0][:70]}", flush=True)
-                if last_kind == "NO-RESULTS-THROTTLED":
-                    # 限流: 冷却等待 + 清会话, 而不是快速重试火上浇油
-                    print(f"    [browser] 触发限流, 冷却 {THROTTLE_COOLDOWN}s 后清 cookie 重试...", flush=True)
-                    time.sleep(THROTTLE_COOLDOWN)
-                    self.ctx.clear_cookies()
-                    self._warmed = False
-                else:
-                    time.sleep(5 * attempt + random.uniform(0, 3))
+                time.sleep(5 * attempt + random.uniform(0, 3))
         raise RuntimeError(f"browser fetch failed after 3 attempts ({last_kind}): {url[:80]}")
 
     def close(self):
